@@ -1,0 +1,205 @@
+﻿#!/usr/bin/env python3
+"""winhost - talk to the Windows host from inside the Kali VM.
+
+The host runs a small executor on its own 127.0.0.1:8899 and reaches this VM
+through an SSH reverse tunnel, so this tool just speaks plain HTTP to
+127.0.0.1. No firewall hole, no extra open port on the host.
+
+Usage
+    winhost health
+    winhost run "<powershell command>"            # also: --shell cmd --cwd C:\\dir --timeout 600
+    winhost ls   "C:\\Users\\LZY20\\Desktop"
+    winhost get  "C:\\path\\file.mp4" ./file.mp4
+    winhost put  ./file.mp4 "C:\\path\\file.mp4"
+    winhost sh   "<cmd.exe command>"
+
+Environment
+    HOST_BRIDGE_TOKEN   shared token (default: ~/.config/dsh-host-bridge/token)
+    HOST_BRIDGE_URL     base URL (default: http://127.0.0.1:8899)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_URL = os.environ.get("HOST_BRIDGE_URL", "http://127.0.0.1:8899")
+TOKEN_PATH = Path(
+    os.environ.get("HOST_BRIDGE_TOKEN_FILE", str(Path.home() / ".config/dsh-host-bridge/token"))
+)
+
+
+def load_token() -> str:
+    override = os.environ.get("HOST_BRIDGE_TOKEN")
+    if override:
+        return override.strip()
+    if TOKEN_PATH.exists():
+        return TOKEN_PATH.read_text(encoding="utf-8").strip()
+    sys.exit(
+        f"winhost: no bridge token at {TOKEN_PATH}\n"
+        "  copy it from the winhost: vm-bridge/token.txt (ask the host agent to re-run run_bridge.ps1 "
+        "if it is missing)"
+    )
+
+
+def request(method: str, path: str, *, body: bytes | None = None, headers: dict | None = None):
+    url = DEFAULT_URL.rstrip("/") + path
+    hdrs = {"X-Bridge-Token": load_token()}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        return urllib.request.urlopen(req, timeout=3600)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        sys.exit(f"winhost: HTTP {exc.code} from bridge: {detail}")
+    except urllib.error.URLError as exc:
+        sys.exit(
+            f"winhost: cannot reach the bridge at {DEFAULT_URL} ({exc.reason}).\n"
+            "  the tunnel is down: on the host run vm-bridge\\start-bridge.vbs "
+            "(or check vm-bridge\\bridge.log)"
+        )
+
+
+def ensure_ok() -> None:
+    json.loads(request("GET", "/health").read().decode("utf-8"))
+
+
+def cmd_health(_args) -> int:
+    with request("GET", "/health") as response:
+        print(json.dumps(json.loads(response.read().decode("utf-8")), indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_run(args) -> int:
+    command = " ".join(args.command)
+    if not command:
+        sys.exit("winhost run: needs a command")
+    payload = {"cmd": command, "shell": args.shell, "cwd": args.cwd, "timeout": args.timeout}
+    with request(
+        "POST",
+        "/run",
+        body=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    ) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if result.get("stdout"):
+        sys.stdout.write(result["stdout"])
+        if not result["stdout"].endswith("\n"):
+            sys.stdout.write("\n")
+    if result.get("stderr"):
+        sys.stderr.write(result["stderr"])
+        if not result["stderr"].endswith("\n"):
+            sys.stderr.write("\n")
+
+    exit_code = result.get("exit")
+    if exit_code not in (0, None):
+        sys.stderr.write(f"[remote exit {exit_code}]\n")
+    elif exit_code == 0 and result.get("durationMs") is not None and args.verbose:
+        sys.stderr.write(f"[ok in {result['durationMs']} ms]\n")
+    return int(exit_code or 0)
+
+
+def cmd_ls(args) -> int:
+    query = urllib.parse.urlencode({"path": args.path})
+    with request("GET", f"/ls?{query}") as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+    for entry in sorted(data["entries"], key=lambda e: (not e["dir"], e["name"].lower())):
+        kind = "dir " if entry["dir"] else "file"
+        size = "" if entry["dir"] else f"{entry['size']:>12,}"
+        print(f"{kind} {size}  {entry['name']}")
+    return 0
+
+
+def cmd_get(args) -> int:
+    query = urllib.parse.urlencode({"path": args.remote})
+    target = Path(args.local)
+    with request("GET", f"/get?{query}") as response:
+        total = int(response.headers.get("Content-Length") or 0)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with open(target, "wb") as handle:
+            while chunk := response.read(1024 * 256):
+                handle.write(chunk)
+                written += len(chunk)
+        print(f"got {written:,} bytes -> {target}")
+    if total and written != total:
+        sys.exit(f"winhost get: short read ({written} of {total} bytes)")
+    return 0
+
+
+def cmd_put(args) -> int:
+    source = Path(args.local)
+    if not source.is_file():
+        sys.exit(f"winhost put: no such file {source}")
+    size = source.stat().st_size
+    query = urllib.parse.urlencode({"path": args.remote})
+    with open(source, "rb") as handle:
+        data = handle.read()
+    with request(
+        "POST",
+        f"/put?{query}",
+        body=data,
+        headers={"Content-Type": "application/octet-stream"},
+    ) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    print(f"put {size:,} bytes -> {result.get('path')}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="winhost",
+        description="run commands and move files on the Windows host from inside the Kali VM",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    p = sub.add_parser("health", help="check the bridge")
+    p.set_defaults(func=cmd_health)
+
+    p = sub.add_parser("run", help="run a PowerShell command on the host")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.add_argument("--shell", choices=["powershell", "cmd"], default="powershell")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--timeout", type=float, default=0, help="seconds; 0 = no limit")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("sh", help="run a cmd.exe command on the host")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--timeout", type=float, default=0)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_run, shell="cmd")
+
+    p = sub.add_parser("ls", help="list a directory on the host")
+    p.add_argument("path", nargs="?", default=os.path.expanduser("~"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("get", help="copy a file from the host")
+    p.add_argument("remote")
+    p.add_argument("local")
+    p.set_defaults(func=cmd_get)
+
+    p = sub.add_parser("put", help="copy a file to the host")
+    p.add_argument("local")
+    p.add_argument("remote")
+    p.set_defaults(func=cmd_put)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
